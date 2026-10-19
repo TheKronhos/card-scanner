@@ -27,5 +27,8 @@ npm test          # unit tests (vitest), uses tests/fixtures/cards-mini.sqlite3
 npm run build     # production build in dist/
 ```
 
-In production the app downloads card data from `https://thekronhos.github.io/mtg-scanner-data/`.
-Override with `VITE_PACK_BASE`.
+## Hosting
+
+Every push to `main` builds the app and publishes it to GitHub Pages at
+`https://thekronhos.github.io/card-scanner/` (see `.github/workflows/deploy.yml`). In production the app downloads
+card data from `https://thekronhos.github.io/mtg-scanner-data/`; override with `VITE_PACK_BASE`.

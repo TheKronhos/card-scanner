@@ -25,7 +25,9 @@ function devPack(): Plugin {
 
 const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
 
-export default defineConfig({
+// Served from https://thekronhos.github.io/card-scanner/ (GitHub Pages project site).
+export default defineConfig(({ command, isPreview }) => ({
+  base: command === 'build' || isPreview ? '/card-scanner/' : '/',
   define: { __APP_VERSION__: JSON.stringify(pkg.version) },
   plugins: [
     react(),
@@ -41,7 +43,8 @@ export default defineConfig({
         background_color: '#14161a',
         display: 'standalone',
         orientation: 'any',
-        start_url: '/',
+        start_url: './',
+        scope: './',
         icons: [
           { src: 'icon-192.png', sizes: '192x192', type: 'image/png' },
           { src: 'icon-512.png', sizes: '512x512', type: 'image/png' },
@@ -51,7 +54,7 @@ export default defineConfig({
       workbox: {
         globPatterns: ['**/*.{js,css,html,svg,png,wasm}'],
         maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
-        navigateFallback: '/index.html',
+        navigateFallback: 'index.html',
         runtimeCaching: [
           {
             // Card thumbnails seen once stay available offline.
@@ -70,4 +73,4 @@ export default defineConfig({
   optimizeDeps: { exclude: ['@sqlite.org/sqlite-wasm'] },
   worker: { format: 'es' },
   test: { include: ['tests/**/*.test.ts'] },
-})
+}))
