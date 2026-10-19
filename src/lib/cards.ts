@@ -34,7 +34,7 @@ export function masterColorLabel(raw: string): string {
 export function normName(s: string): string {
   return s
     .normalize('NFKD')
-    .replace(/[̀-ͯ]/g, '')
+    .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
     .replace(/[^a-z0-9/ ]+/g, ' ')
     .replace(/\s+/g, ' ')

@@ -5,6 +5,7 @@ export type Route =
   | { name: 'session'; id: number }
   | { name: 'collection' }
   | { name: 'data' }
+  | { name: 'settings' }
   | { name: 'about' };
 
 // The phone's back button / gesture closes the top sheet first, then goes back a screen.
@@ -22,8 +23,19 @@ window.addEventListener('popstate', (e) => {
     top.close();
     return;
   }
+  // A sheet entry with no sheet open is left over from a reload while a sheet was up: skip past it.
+  if (e.state?.sheet) {
+    history.back();
+    return;
+  }
   setRouteFromHistory?.((e.state?.route as Route) ?? { name: 'home' });
 });
+
+// Reloaded while a sheet was open: step back off its entry so the next Back press leaves the screen.
+if (history.state?.sheet) {
+  ignorePops++;
+  history.back();
+}
 
 export function useRoute(): [Route, (r: Route) => void, () => void] {
   const [route, setRoute] = useState<Route>(() => (history.state?.route as Route) ?? { name: 'home' });
@@ -52,7 +64,7 @@ export function useBackToClose(onClose: () => void) {
   useEffect(() => {
     const entry = { close: () => ref.current() };
     sheets.push(entry);
-    history.pushState({ ...history.state }, '');
+    history.pushState({ ...history.state, sheet: true }, '');
     return () => {
       const i = sheets.indexOf(entry);
       if (i >= 0) {

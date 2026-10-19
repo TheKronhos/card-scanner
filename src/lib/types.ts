@@ -1,7 +1,8 @@
 export type Finish = 'nonfoil' | 'foil' | 'etched';
 export type Condition = 'NM' | 'LP' | 'MP' | 'HP' | 'DMG';
 export type FoilMode = 'nonfoil' | 'foil' | 'ask';
-export type SessionKind = 'add' | 'verify';
+/** scan = "Just scan": records exactly what was scanned, no collection and no comparison. */
+export type SessionKind = 'scan' | 'add' | 'verify';
 /** saved = green, check = saved but flagged (yellow), review = not saved yet, needs a pick (red). */
 export type ScanStatus = 'saved' | 'check' | 'review';
 
@@ -54,10 +55,24 @@ export interface SessionSummary extends Session {
   total_usd: number;
 }
 
+/** A possible printing for a scan the recognizer wasn't sure about (best first). */
+export interface Candidate {
+  printing_id: string;
+  name: string;
+  set_code: string;
+  collector_number: string;
+  colors: string;
+  front_type: string;
+  img_ver?: string | null;
+  score: number | null; // 0..1
+}
+
 /** One entry in a session: a physical card (or qty copies of it). Card fields are a snapshot of the printing. */
 export interface Scan {
   id: number;
   session_id: number;
+  /** Scan number within the session (1, 2, 3...). Never reused, so photo names stay stable. */
+  seq: number;
   printing_id: string | null; // null while it's in the review queue
   name: string;
   set_code: string;
@@ -74,6 +89,12 @@ export interface Scan {
   confidence: number | null; // 0..1, null for manual adds
   source: 'manual' | 'scan';
   flag_reason: string;
+  /** Top candidate printings from recognition, best first (empty for manual adds). */
+  candidates: Candidate[];
+  /** Set when this scan was a "Replace last" correction: the scan it replaced is hidden everywhere. */
+  replaces_id: number | null;
+  /** The user picked or changed the printing of a scanned card by hand (e.g. in the review queue). */
+  fixed_by_hand: boolean;
   created_at: string;
 }
 

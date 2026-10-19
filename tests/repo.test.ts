@@ -160,3 +160,111 @@ describe('Repo: real Master sample (tests/fixtures/master-sample.csv)', () => {
     expect(repo.owned([zombify.id])[zombify.id]).toEqual({ nonfoil: 3, foil: 0, etched: 0 });
   });
 });
+
+describe('Repo: Just scan session and Scan file export', () => {
+  const jpeg = (n: number) => new Uint8Array([0xff, 0xd8, n, 0xff, 0xd9]);
+
+  it('records what was scanned, one row per copy, with photos for check/review', async () => {
+    const { unzipSync, strFromU8 } = await import('fflate');
+    const repo = await makeRepo();
+    const s = repo.createSession('Bulk box', 'scan', 'nonfoil');
+    const cand = (set: string, num: string) => {
+      const p = repo.lookup(set, num)[0];
+      return { printing_id: p.id, name: p.name, set_code: p.set_code, collector_number: p.collector_number, colors: p.colors, front_type: p.front_type, score: 0.5 };
+    };
+    const bolt = repo.lookup('m10', '146')[0];
+    const jace = repo.lookup('2xm', '56')[0];
+
+    // 1: saved scan with a photo (photo only exported when "all photos" is on)
+    const a = repo.addScan(s.id, { printing_id: bolt.id, source: 'scan', confidence: 0.99, photo: jpeg(1) });
+    // 2: misread, then replaced (3) -> 2 is left out of everything
+    const misread = repo.addScan(s.id, { printing_id: bolt.id, source: 'scan', confidence: 0.97, photo: jpeg(2) });
+    const fixed = repo.replaceScan(misread.id, { printing_id: jace.id, source: 'scan', confidence: 0.98, photo: jpeg(3), qty: 2 });
+    // 4: check (two signals agreed)
+    repo.addScan(s.id, { printing_id: jace.id, source: 'scan', confidence: 0.8, status: 'check', flag_reason: 'Art match weak', photo: jpeg(4), candidates: [cand('2xm', '56'), cand('2xm', '334')] });
+    // 5: review queue, same card name across candidates
+    repo.addScan(s.id, { printing_id: null, source: 'scan', confidence: 0.4, photo: jpeg(5), candidates: [cand('2xm', '56'), cand('a25', '62'), cand('wwk', '31')] });
+    // 6: review queue, later fixed by hand
+    const r6 = repo.addScan(s.id, { printing_id: null, source: 'scan', confidence: 0.3, photo: jpeg(6), candidates: [cand('m10', '146'), cand('2xm', '56')] });
+    repo.updateScan(r6.id, { printing_id: bolt.id });
+
+    expect(repo.scanRows(s.id).map((r) => r.seq)).toEqual([6, 5, 4, 3, 1]);
+    expect(repo.lastScan(s.id)!.seq).toBe(6);
+
+    const out = repo.exportScanFile(s.id);
+    expect(out).toMatchObject({ filename: 'Bulk-box-scan-file.zip', review_count: 1, rows: 6, photos: 3 });
+    const zip = unzipSync(out.bytes);
+    expect(Object.keys(zip).sort()).toEqual(['photos/', 'photos/0004.jpg', 'photos/0005.jpg', 'photos/0006.jpg', 'scan.csv']);
+    expect([...zip['photos/0005.jpg']]).toEqual([...jpeg(5)]);
+
+    const csv = parseCsv(strFromU8(zip['scan.csv']));
+    expect(csv[0]).toEqual(['Scan #', 'Time', 'Color', 'Card', 'Set', 'Set name', 'Collector #', 'Finish', 'Condition', 'Scryfall ID', 'Price', 'Confidence', 'Status', 'Flag reason', 'Top 3 candidates', 'Photo file']);
+    const col = (row: string[], name: string) => row[csv[0].indexOf(name)];
+    const body = csv.slice(1);
+    expect(body.map((r) => [r[0], col(r, 'Card'), col(r, 'Set'), col(r, 'Status'), col(r, 'Flag reason'), col(r, 'Photo file')])).toEqual([
+      ['0001', 'Lightning Bolt', 'M10', 'saved', '', ''],
+      ['0003', 'Jace, the Mind Sculptor', '2XM', 'saved', '', ''],
+      ['0003-2', 'Jace, the Mind Sculptor', '2XM', 'saved', '', ''],
+      ['0004', 'Jace, the Mind Sculptor', '2XM', 'check', 'Art match weak', 'photos/0004.jpg'],
+      ['0005', 'Jace, the Mind Sculptor', '', 'review', 'Not sure which printing', 'photos/0005.jpg'],
+      ['0006', 'Lightning Bolt', 'M10', 'saved', 'fixed by hand', 'photos/0006.jpg'],
+    ]);
+    const review = body[4];
+    expect(col(review, 'Top 3 candidates')).toBe('2XM 56 | A25 62 | WWK 31');
+    expect(col(review, 'Color')).toBe('Blue');
+    expect(col(review, 'Scryfall ID')).toBe('');
+    expect(col(body[0], 'Color')).toBe('Red');
+    expect(col(body[0], 'Scryfall ID')).toBe(a.printing_id);
+    expect(col(body[0], 'Confidence')).toBe('99%');
+    expect(col(body[0], 'Time')).toMatch(/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/);
+    expect(fixed.replaces_id).toBe(misread.id);
+
+    repo.setSetting('scanfile_all_photos', true);
+    const all = unzipSync(repo.exportScanFile(s.id).bytes);
+    expect(Object.keys(all)).toContain('photos/0001.jpg');
+    expect(Object.keys(all)).toContain('photos/0003.jpg');
+    expect(Object.keys(all)).not.toContain('photos/0002.jpg');
+  });
+
+  it('undo removes the latest card and restore brings back its photo; scan numbers are never reused', async () => {
+    const repo = await makeRepo();
+    const s = repo.createSession('x', 'scan', 'nonfoil');
+    const bolt = repo.lookup('m10', '146')[0];
+    repo.addScan(s.id, { printing_id: bolt.id, source: 'scan', photo: jpeg(1) });
+    const second = repo.addScan(s.id, { printing_id: bolt.id, source: 'scan', photo: jpeg(2) });
+    const gone = repo.deleteScan(repo.lastScan(s.id)!.id)!;
+    expect(gone.scan.id).toBe(second.id);
+    expect(repo.addScan(s.id, { printing_id: bolt.id }).seq).toBe(3);
+    const restored = repo.restoreScan(gone);
+    expect([...repo.getPhoto(restored)!]).toEqual([...jpeg(2)]);
+    expect(repo.scanRows(s.id).map((r) => r.seq)).toEqual([3, 2, 1]);
+  });
+
+  it('undoing a Replace last brings the replaced scan back', async () => {
+    const repo = await makeRepo();
+    const s = repo.createSession('x', 'scan', 'nonfoil');
+    const bolt = repo.lookup('m10', '146')[0];
+    const jace = repo.lookup('2xm', '56')[0];
+    const first = repo.addScan(s.id, { printing_id: bolt.id, source: 'scan' });
+    const fix = repo.replaceScan(first.id, { printing_id: jace.id, source: 'scan' });
+    expect(repo.scanRows(s.id).map((r) => r.id)).toEqual([fix.id]);
+    repo.deleteScan(fix.id);
+    expect(repo.scanRows(s.id).map((r) => r.id)).toEqual([first.id]);
+  });
+});
+
+describe('user DB migration', () => {
+  it('upgrades a v1 database: existing scans get scan numbers in order', async () => {
+    const sqlite3InitModule = (await import('@sqlite.org/sqlite-wasm')).default;
+    const { USER_MIGRATIONS, migrateUserDb } = await import('../src/db/repo');
+    const sqlite3 = await sqlite3InitModule();
+    const db = new sqlite3.oo1.DB(':memory:', 'c');
+    db.exec(USER_MIGRATIONS[0]);
+    db.exec('PRAGMA user_version = 1');
+    db.exec("INSERT INTO sessions (id, name, created_at, updated_at) VALUES (1, 'old', 't', 't'), (2, 'other', 't', 't')");
+    db.exec("INSERT INTO scans (id, session_id, created_at) VALUES (10, 1, 't'), (11, 2, 't'), (12, 1, 't')");
+    migrateUserDb(db);
+    expect(db.selectObjects('SELECT id, seq FROM scans ORDER BY id')).toEqual([{ id: 10, seq: 1 }, { id: 11, seq: 1 }, { id: 12, seq: 2 }]);
+    expect(db.selectObjects('SELECT id, next_seq FROM sessions ORDER BY id')).toEqual([{ id: 1, next_seq: 3 }, { id: 2, next_seq: 2 }]);
+  });
+});

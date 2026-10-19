@@ -4,9 +4,11 @@ import type { DiffRow, Holding } from '../lib/diff';
 import { verifyDiff } from '../lib/diff';
 import { differencesCsv, manaboxCsv, masterPasteCsv, reviewCsv } from '../lib/exports';
 import { matchRows, parseMasterCsv } from '../lib/importMaster';
+import { photoPath, scanFileCsv, wantsPhoto } from '../lib/scanFile';
+import { strToU8, zipSync, type Zippable } from 'fflate';
 import type { MatchedRow } from '../lib/importMaster';
 import type {
-  Condition, Finish, FoilMode, Printing, Scan, ScanRow, ScanStatus, Session, SessionKind, SessionSummary,
+  Candidate, Condition, Finish, FoilMode, Printing, Scan, ScanRow, ScanStatus, Session, SessionKind, SessionSummary,
 } from '../lib/types';
 
 /** Card-data pack schema this app understands (see mtg-scanner-data/scripts/build-pack.mjs). */
@@ -14,7 +16,7 @@ export const PACK_SCHEMA_VERSION = 1;
 
 type Row = Record<string, SqlValue>;
 
-const USER_MIGRATIONS: string[] = [
+export const USER_MIGRATIONS: string[] = [
   `CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
    CREATE TABLE sessions (
      id INTEGER PRIMARY KEY,
@@ -68,7 +70,22 @@ const USER_MIGRATIONS: string[] = [
      note TEXT NOT NULL DEFAULT '');
    CREATE INDEX import_rows_import ON import_rows (import_id);
    CREATE INDEX import_rows_printing ON import_rows (printing_id);`,
+  // v2: "Just scan" support: scan numbers, recognition candidates, Replace last, fixed-by-hand, card photos.
+  `ALTER TABLE sessions ADD COLUMN next_seq INTEGER NOT NULL DEFAULT 1;
+   ALTER TABLE scans ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+   ALTER TABLE scans ADD COLUMN candidates TEXT NOT NULL DEFAULT '[]';
+   ALTER TABLE scans ADD COLUMN replaces_id INTEGER;
+   ALTER TABLE scans ADD COLUMN fixed_by_hand INTEGER NOT NULL DEFAULT 0;
+   UPDATE scans SET seq = (SELECT COUNT(*) FROM scans s2 WHERE s2.session_id = scans.session_id AND s2.id <= scans.id);
+   UPDATE sessions SET next_seq = 1 + (SELECT COALESCE(MAX(seq), 0) FROM scans WHERE scans.session_id = sessions.id);
+   CREATE INDEX scans_replaces ON scans (replaces_id);
+   CREATE TABLE scan_photos (
+     scan_id INTEGER PRIMARY KEY REFERENCES scans(id) ON DELETE CASCADE,
+     jpeg BLOB NOT NULL);`,
 ];
+
+/** Scans hidden because a later "Replace last" scan corrected them. */
+const VISIBLE = 'NOT EXISTS (SELECT 1 FROM scans r WHERE r.replaces_id = scans.id)';
 
 export function migrateUserDb(db: Database): void {
   db.exec('PRAGMA foreign_keys = ON');
@@ -127,6 +144,7 @@ function toScan(r: Row): Scan {
   return {
     id: Number(r.id),
     session_id: Number(r.session_id),
+    seq: Number(r.seq),
     printing_id: r.printing_id == null ? null : String(r.printing_id),
     name: String(r.name),
     set_code: String(r.set_code),
@@ -143,6 +161,9 @@ function toScan(r: Row): Scan {
     confidence: num(r.confidence),
     source: String(r.source) as Scan['source'],
     flag_reason: String(r.flag_reason),
+    candidates: JSON.parse(String(r.candidates ?? '[]')) as Candidate[],
+    replaces_id: r.replaces_id == null ? null : Number(r.replaces_id),
+    fixed_by_hand: !!r.fixed_by_hand,
     created_at: String(r.created_at),
   };
 }
@@ -169,6 +190,13 @@ export interface SearchHit {
   name: string;
   printings: number;
   newest: Printing;
+}
+
+interface NameEntry {
+  oracle_id: string;
+  name: string;
+  norm: string;
+  printings: number;
 }
 
 export interface Owned {
@@ -208,8 +236,32 @@ export interface ExportFile {
   review_count: number;
 }
 
+export interface ScanFileExport {
+  filename: string;
+  bytes: Uint8Array;
+  /** Review-queue cards; they are in the file with Status = review. */
+  review_count: number;
+  rows: number;
+  photos: number;
+}
+
+export interface Settings {
+  /** Scan file export: include a photo for every card, not only check/review ones. */
+  scanfile_all_photos: boolean;
+}
+
+export interface DeletedScan {
+  scan: Scan;
+  photo: Uint8Array | null;
+}
+
 export interface AddScanInput {
-  printing_id: string;
+  /** null = not sure which printing: the card goes to the review queue with its candidates. */
+  printing_id: string | null;
+  candidates?: Candidate[];
+  /** Straightened card image (JPEG). */
+  photo?: Uint8Array;
+  replaces_id?: number;
   finish?: Finish;
   condition?: Condition;
   qty?: number;
@@ -300,20 +352,46 @@ export class Repo {
     if (m) exact.push(...this.lookup(m[1], m[2]));
     const n = normName(q);
     if (n.length < 2) return { exact, names: [] };
-    const rows = db.selectObjects(
-      `SELECT oracle_id, name, COUNT(*) AS printings, MAX(released_at) AS newest_date,
-              MIN(name_norm = $n) AS is_exact, MIN(name_norm LIKE $prefix) AS is_prefix
-         FROM printings WHERE name_norm LIKE $any
-        GROUP BY oracle_id
-        ORDER BY is_exact DESC, is_prefix DESC, name
-        LIMIT $limit`,
-      { $n: n, $prefix: `${n}%`, $any: `%${n}%`, $limit: limit },
-    );
-    const names: SearchHit[] = rows.map((r) => {
-      const newest = db.selectObject(`${PRINTING_SELECT} WHERE p.oracle_id = ? ORDER BY p.released_at DESC, p.collector_number LIMIT 1`, [r.oracle_id]);
-      return { oracle_id: String(r.oracle_id), name: String(r.name), printings: Number(r.printings), newest: toPrinting(newest!) };
+    // Exact name first, then names starting with the query, then names containing it.
+    const rank = (e: NameEntry) => (e.norm === n ? 0 : e.norm.startsWith(n) ? 1 : 2);
+    const hits = this.nameIndex()
+      .filter((e) => e.norm.includes(n))
+      .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name))
+      .slice(0, limit);
+    const names: SearchHit[] = hits.map((e) => {
+      const newest = db.selectObject(`${PRINTING_SELECT} WHERE p.oracle_id = ? ORDER BY p.released_at DESC, p.collector_number LIMIT 1`, [e.oracle_id]);
+      return { oracle_id: e.oracle_id, name: e.name, printings: e.printings, newest: toPrinting(newest!) };
     });
     return { exact, names };
+  }
+
+  private names: { db: Database; list: NameEntry[] } | null = null;
+
+  /** Load the name index ahead of the first search (no-op without card data). */
+  warmUp(): void {
+    if (this.cards) this.nameIndex();
+  }
+
+  /** One entry per card (oracle id), built once per card-data install; searching it is much faster than SQL LIKE. */
+  private nameIndex(): NameEntry[] {
+    const db = this.requireCards();
+    if (this.names?.db !== db) {
+      // One sequential pass over the table, grouped here: in the browser's file storage a GROUP BY (index order, random
+      // page reads) took ~9 s against ~0.1 s for this.
+      const byOracle = new Map<string, NameEntry>();
+      db.exec({
+        sql: 'SELECT oracle_id, name, name_norm FROM printings WHERE oracle_id IS NOT NULL',
+        rowMode: 'array',
+        callback: (r) => {
+          const id = String(r[0]);
+          const e = byOracle.get(id);
+          if (e) e.printings++;
+          else byOracle.set(id, { oracle_id: id, name: String(r[1]), norm: String(r[2]), printings: 1 });
+        },
+      });
+      this.names = { db, list: [...byOracle.values()] };
+    }
+    return this.names.list;
   }
 
   printingsOf(oracleId: string): Printing[] {
@@ -326,7 +404,7 @@ export class Repo {
 
   listSessions(): SessionSummary[] {
     const sessions = this.user.selectObjects('SELECT * FROM sessions ORDER BY updated_at DESC').map(toSession);
-    const scans = this.user.selectObjects('SELECT session_id, printing_id, finish, qty, status FROM scans');
+    const scans = this.user.selectObjects(`SELECT session_id, printing_id, finish, qty, status FROM scans WHERE ${VISIBLE}`);
     const prices = this.getPrintings(scans.map((s) => s.printing_id).filter(Boolean).map(String));
     return sessions.map((s) => {
       let copies = 0;
@@ -379,8 +457,9 @@ export class Repo {
 
   // ---- scans ----
 
+  /** The session's cards, newest first. Scans replaced with "Replace last" are left out. */
   scanRows(sessionId: number): ScanRow[] {
-    const scans = this.user.selectObjects('SELECT * FROM scans WHERE session_id = ? ORDER BY id DESC', [sessionId]).map(toScan);
+    const scans = this.user.selectObjects(`SELECT * FROM scans WHERE session_id = ? AND ${VISIBLE} ORDER BY seq DESC, id DESC`, [sessionId]).map(toScan);
     const prices = this.getPrintings(scans.map((s) => s.printing_id).filter((x): x is string => !!x));
     return scans.map((s) => {
       const p = s.printing_id ? prices.get(s.printing_id) : undefined;
@@ -393,51 +472,85 @@ export class Repo {
     return r ? toScan(r) : null;
   }
 
+  /**
+   * Save a card. With a printing it is saved (green) or saved-but-check (yellow); with printing_id null it goes to the
+   * review queue (red) holding its candidates, and is not counted until a printing is picked.
+   */
   addScan(sessionId: number, input: AddScanInput): Scan {
     const session = this.getSession(sessionId);
     if (!session) throw new Error('Session not found');
-    const p = this.getPrinting(input.printing_id);
-    if (!p) throw new Error(`Unknown printing ${input.printing_id}`);
-    const auto = chooseFinish(p.finishes, session.foil_mode);
-    const finish = input.finish ?? auto.finish;
-    if (!finish) throw new Error('Pick a finish for this card');
-    if (p.finishes.length && !p.finishes.includes(finish)) throw new Error(`${p.name} [${p.set_code.toUpperCase()} ${p.collector_number}] has no ${finish} version`);
-    const flags = [input.flag_reason, sessionFinishFlag(finish, p.finishes, session.foil_mode)].filter(Boolean);
-    const status: ScanStatus = input.status ?? (flags.length ? 'check' : 'saved');
-    this.tx(() => {
+    const p = input.printing_id ? this.getPrinting(input.printing_id) : null;
+    if (input.printing_id && !p) throw new Error(`Unknown printing ${input.printing_id}`);
+
+    let finish: Finish;
+    let flags: string[];
+    let status: ScanStatus;
+    if (p) {
+      const chosen = input.finish ?? chooseFinish(p.finishes, session.foil_mode).finish;
+      if (!chosen) throw new Error('Pick a finish for this card');
+      if (p.finishes.length && !p.finishes.includes(chosen)) throw new Error(`${p.name} [${p.set_code.toUpperCase()} ${p.collector_number}] has no ${chosen} version`);
+      finish = chosen;
+      flags = [input.flag_reason ?? '', sessionFinishFlag(finish, p.finishes, session.foil_mode)].filter(Boolean);
+      status = input.status ?? (flags.length ? 'check' : 'saved');
+    } else {
+      finish = input.finish ?? (session.foil_mode === 'foil' ? 'foil' : 'nonfoil');
+      flags = [input.flag_reason || 'Not sure which printing'];
+      status = 'review';
+    }
+
+    const id = this.tx(() => {
+      const seq = Number(this.user.selectValue('SELECT next_seq FROM sessions WHERE id = ?', [sessionId]));
+      this.user.exec('UPDATE sessions SET next_seq = next_seq + 1 WHERE id = ?', { bind: [sessionId] });
       this.user.exec(
-        `INSERT INTO scans (session_id, printing_id, name, set_code, set_name, collector_number, rarity, colors, front_type,
-           img_ver, finish, condition, qty, status, confidence, source, flag_reason, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO scans (session_id, seq, printing_id, name, set_code, set_name, collector_number, rarity, colors, front_type,
+           img_ver, finish, condition, qty, status, confidence, source, flag_reason, candidates, replaces_id, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         {
-          bind: [sessionId, p.id, p.name, p.set_code, p.set_name, p.collector_number, p.rarity, p.colors, p.front_type,
-            p.img_ver, finish, input.condition ?? session.default_condition, Math.max(1, input.qty ?? 1), status,
-            input.confidence ?? null, input.source ?? 'manual', flags.join('; '), now()],
+          bind: [sessionId, seq, p?.id ?? null, p?.name ?? '', p?.set_code ?? '', p?.set_name ?? '', p?.collector_number ?? '',
+            p?.rarity ?? '', p?.colors ?? '', p?.front_type ?? '', p?.img_ver ?? null, finish,
+            input.condition ?? session.default_condition, Math.max(1, input.qty ?? 1), status, input.confidence ?? null,
+            input.source ?? 'manual', flags.join('; '), JSON.stringify(input.candidates ?? []), input.replaces_id ?? null, now()],
         },
       );
+      const newId = Number(this.user.selectValue('SELECT last_insert_rowid()'));
+      if (input.photo) this.user.exec('INSERT INTO scan_photos (scan_id, jpeg) VALUES (?, ?)', { bind: [newId, input.photo] });
       this.touch(sessionId);
+      return newId;
     });
-    return this.getScan(Number(this.user.selectValue('SELECT last_insert_rowid()')))!;
+    return this.getScan(id)!;
   }
 
-  /** Change printing, finish, condition or quantity. A new printing re-snapshots the card fields. */
+  /** "Replace last": the new scan takes the place of a misread one, which is then hidden everywhere. */
+  replaceScan(oldId: number, input: AddScanInput): Scan {
+    const old = this.getScan(oldId);
+    if (!old) throw new Error('Card to replace not found');
+    return this.addScan(old.session_id, { ...input, replaces_id: oldId });
+  }
+
+  /**
+   * Change printing, finish, condition or quantity. A new printing re-snapshots the card fields. Picking the printing of
+   * a review-queue card, or changing the printing of any scanned card, marks it fixed by hand.
+   */
   updateScan(id: number, patch: { printing_id?: string; finish?: Finish; condition?: Condition; qty?: number }): Scan {
     const scan = this.getScan(id);
     if (!scan) throw new Error('Card not found');
     const session = this.getSession(scan.session_id)!;
     const p = this.getPrinting(patch.printing_id ?? scan.printing_id ?? '');
     if (!p) throw new Error('Pick a printing first');
+    const printingChanged = p.id !== scan.printing_id;
     let finish = patch.finish ?? scan.finish;
     if (p.finishes.length && !p.finishes.includes(finish)) finish = chooseFinish(p.finishes, session.foil_mode).finish ?? p.finishes[0];
-    const flag = sessionFinishFlag(finish, p.finishes, session.foil_mode);
+    const fixed = scan.fixed_by_hand || scan.status === 'review' || (scan.source === 'scan' && printingChanged);
     // A manual edit is the user confirming the card, so it clears the review/check state.
+    const flag = fixed ? 'fixed by hand' : sessionFinishFlag(finish, p.finishes, session.foil_mode);
+    const status: ScanStatus = fixed || !flag ? 'saved' : 'check';
     this.tx(() => {
       this.user.exec(
         `UPDATE scans SET printing_id = ?, name = ?, set_code = ?, set_name = ?, collector_number = ?, rarity = ?, colors = ?,
-           front_type = ?, img_ver = ?, finish = ?, condition = ?, qty = ?, status = ?, flag_reason = ? WHERE id = ?`,
+           front_type = ?, img_ver = ?, finish = ?, condition = ?, qty = ?, status = ?, flag_reason = ?, fixed_by_hand = ? WHERE id = ?`,
         {
           bind: [p.id, p.name, p.set_code, p.set_name, p.collector_number, p.rarity, p.colors, p.front_type, p.img_ver, finish,
-            patch.condition ?? scan.condition, Math.max(1, patch.qty ?? scan.qty), flag ? 'check' : 'saved', flag, id],
+            patch.condition ?? scan.condition, Math.max(1, patch.qty ?? scan.qty), status, flag, fixed ? 1 : 0, id],
         },
       );
       this.touch(scan.session_id);
@@ -445,30 +558,60 @@ export class Repo {
     return this.getScan(id)!;
   }
 
-  /** Delete and return the row, so the UI can offer to restore it. */
-  deleteScan(id: number): Scan | null {
+  /** Delete and return the row (with its photo), so the UI can offer to restore it. */
+  deleteScan(id: number): DeletedScan | null {
     const scan = this.getScan(id);
     if (!scan) return null;
+    const photo = this.getPhoto(id);
     this.tx(() => {
       this.user.exec('DELETE FROM scans WHERE id = ?', { bind: [id] });
       this.touch(scan.session_id);
     });
-    return scan;
+    return { scan, photo };
   }
 
-  restoreScan(scan: Scan): void {
-    const cols = Object.keys(scan) as (keyof Scan)[];
-    this.tx(() => {
-      this.user.exec(`INSERT INTO scans (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`, {
-        bind: cols.map((c) => scan[c] as SqlValue),
-      });
+  /** Put a deleted scan back (same scan number). Returns its id, which is new if the old id was reused meanwhile. */
+  restoreScan(deleted: DeletedScan): number {
+    const { scan, photo } = deleted;
+    const row: Record<string, SqlValue> = {
+      ...scan,
+      candidates: JSON.stringify(scan.candidates),
+      fixed_by_hand: scan.fixed_by_hand ? 1 : 0,
+    };
+    if (this.getScan(scan.id)) delete row.id;
+    const cols = Object.keys(row);
+    return this.tx(() => {
+      this.user.exec(`INSERT INTO scans (${cols.join(',')}) VALUES (${cols.map(() => '?').join(',')})`, { bind: cols.map((c) => row[c]) });
+      const id = Number(this.user.selectValue('SELECT last_insert_rowid()'));
+      if (photo) this.user.exec('INSERT INTO scan_photos (scan_id, jpeg) VALUES (?, ?)', { bind: [id, photo] });
       this.touch(scan.session_id);
+      return id;
     });
   }
 
+  /** The most recent visible scan: what Undo removes and Replace last corrects. */
   lastScan(sessionId: number): Scan | null {
-    const r = this.user.selectObject('SELECT * FROM scans WHERE session_id = ? ORDER BY id DESC LIMIT 1', [sessionId]);
+    const r = this.user.selectObject(`SELECT * FROM scans WHERE session_id = ? AND ${VISIBLE} ORDER BY seq DESC, id DESC LIMIT 1`, [sessionId]);
     return r ? toScan(r) : null;
+  }
+
+  /** The straightened card photo (JPEG), if one was captured. */
+  getPhoto(scanId: number): Uint8Array | null {
+    const v = this.user.selectValue('SELECT jpeg FROM scan_photos WHERE scan_id = ?', [scanId]);
+    return v instanceof Uint8Array ? v : null;
+  }
+
+  // ---- settings ----
+
+  getSettings(): Settings {
+    const m = Object.fromEntries(this.user.selectObjects('SELECT key, value FROM meta').map((r) => [r.key, r.value]));
+    return { scanfile_all_photos: m.scanfile_all_photos === '1' };
+  }
+
+  setSetting<K extends keyof Settings>(key: K, value: Settings[K]): Settings {
+    const v = typeof value === 'boolean' ? (value ? '1' : '0') : String(value);
+    this.user.exec('INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', { bind: [key, v] });
+    return this.getSettings();
   }
 
   // ---- imports ----
@@ -644,5 +787,38 @@ export class Repo {
       case 'differences':
         return { filename: `${base}-differences.csv`, text: differencesCsv(this.differences(sessionId)), review_count };
     }
+  }
+
+  /**
+   * "Scan file" ZIP for a Just-scan session: scan.csv (one row per copy) plus photos/NNNN.jpg for check and review
+   * cards (or every card, per settings). Review-queue cards are included with their candidates, never blocked.
+   */
+  exportScanFile(sessionId: number): ScanFileExport {
+    const session = this.getSession(sessionId);
+    if (!session) throw new Error('Session not found');
+    const rows = this.scanRows(sessionId);
+    const { scanfile_all_photos: all } = this.getSettings();
+    const withPhoto = new Set(
+      this.user
+        .selectObjects(`SELECT p.scan_id FROM scan_photos p JOIN scans ON scans.id = p.scan_id WHERE scans.session_id = ?`, [sessionId])
+        .map((r) => Number(r.scan_id)),
+    );
+    const files: Zippable = { 'scan.csv': [strToU8(scanFileCsv(rows, (id) => withPhoto.has(id), all)), { level: 6 }], 'photos/': new Uint8Array(0) };
+    let photos = 0;
+    for (const r of rows) {
+      if (!withPhoto.has(r.id) || !wantsPhoto(r, all)) continue;
+      const jpeg = this.getPhoto(r.id);
+      if (jpeg) {
+        files[photoPath(r.seq)] = [jpeg, { level: 0 }]; // already compressed
+        photos++;
+      }
+    }
+    return {
+      filename: `${slug(session.name)}-scan-file.zip`,
+      bytes: zipSync(files),
+      review_count: rows.filter((r) => r.status === 'review').length,
+      rows: rows.reduce((n, r) => n + r.qty, 0),
+      photos,
+    };
   }
 }

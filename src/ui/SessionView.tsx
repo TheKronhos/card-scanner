@@ -13,6 +13,14 @@ import type { Route } from './nav';
 import { ImportRowsSheet } from './CollectionView';
 import { pickFile } from './share';
 
+const KIND_LABEL: Record<Session['kind'], string> = { scan: 'just scan', add: 'add new', verify: 'verify' };
+
+/** Title for a review-queue card: the name when all candidates agree, otherwise a prompt. */
+function reviewTitle(r: Scan): string {
+  const c = r.candidates;
+  return c.length && c.every((x) => x.name === c[0].name) ? c[0].name : 'Pick the printing';
+}
+
 const FOIL_OPTIONS: { value: FoilMode; label: string }[] = [
   { value: 'nonfoil', label: 'Non-foil' },
   { value: 'foil', label: 'Foil' },
@@ -46,7 +54,7 @@ export function SessionView({ id, meta, back }: { id: number; meta: CardsMeta | 
     if (!s) return;
     const r = await db.scanRows(id);
     setRows(r);
-    setOwned(await db.owned(r.map((x) => x.printing_id).filter((x): x is string => !!x)));
+    setOwned(s.kind === 'add' ? await db.owned(r.map((x) => x.printing_id).filter((x): x is string => !!x)) : {});
     if (s.kind === 'verify') {
       setVerifyImport(await db.verifyImport(id));
       setDiff(await db.differences(id));
@@ -89,7 +97,7 @@ export function SessionView({ id, meta, back }: { id: number; meta: CardsMeta | 
     await load();
     if (gone) {
       setToast({
-        text: `${label} ${gone.name}`,
+        text: `${label} ${gone.scan.name || `scan #${gone.scan.seq}`}`,
         undo: async () => {
           await db.restoreScan(gone);
           await load();
@@ -131,7 +139,7 @@ export function SessionView({ id, meta, back }: { id: number; meta: CardsMeta | 
         <div className="stats">
           <div><b>{copies}</b><span>cards</span></div>
           <div><b>{formatUsd(total)}</b><span>{unpriced ? `${unpriced} without price` : 'total'}</span></div>
-          <div><b>{FOIL_OPTIONS.find((o) => o.value === session.foil_mode)?.label}</b><span>{session.kind === 'verify' ? 'verify session' : 'session'}</span></div>
+          <div><b>{FOIL_OPTIONS.find((o) => o.value === session.foil_mode)?.label}</b><span>{KIND_LABEL[session.kind]}</span></div>
         </div>
         {reviewCount > 0 && <p className="err small">{reviewCount} cards still need review.</p>}
 
@@ -160,9 +168,14 @@ export function SessionView({ id, meta, back }: { id: number; meta: CardsMeta | 
                   <span className={`status ${r.status}`} />
                   <Thumb id={r.printing_id} ver={r.img_ver} setCode={r.set_code} />
                   <div className="grow">
-                    <div className="name">{r.qty > 1 ? `${r.qty}× ` : ''}{r.name}</div>
+                    <div className="name">
+                      {r.qty > 1 ? `${r.qty}× ` : ''}
+                      {r.status === 'review' ? <><span className="tag review">REVIEW</span>{reviewTitle(r)}</> : r.name}
+                    </div>
                     <div className="sub">
-                      <FinishTag finish={r.finish} />[{r.set_code.toUpperCase()} {r.collector_number}] · {r.condition} · {colorLabel(r.colors, r.front_type)}
+                      {r.status === 'review'
+                        ? <>#{r.seq} · {r.candidates.length ? r.candidates.slice(0, 3).map((c) => `${c.set_code.toUpperCase()} ${c.collector_number}`).join(' | ') : 'no candidates'}</>
+                        : <><FinishTag finish={r.finish} />[{r.set_code.toUpperCase()} {r.collector_number}] · {r.condition} · {colorLabel(r.colors, r.front_type)}</>}
                     </div>
                     {r.flag_reason ? <div className="sub" style={{ color: 'var(--check)' }}>{r.flag_reason}</div>
                       : r.printing_id && ownedText(owned[r.printing_id]) ? <div className="sub">{ownedText(owned[r.printing_id])}</div> : null}
@@ -290,12 +303,22 @@ function EditSheet({ scanId, onClose, onChanged, onDelete }: { scanId: number; o
   const [printing, setPrinting] = useState<Printing | null>(null);
   const [picking, setPicking] = useState(false);
   const [error, setError] = useState('');
+  const [photoUrl, setPhotoUrl] = useState<string | null>(null);
 
   useEffect(() => {
     db.getScan(scanId).then(async (s) => {
       setScan(s);
       if (s?.printing_id) setPrinting(await db.getPrinting(s.printing_id));
     });
+    let url: string | null = null;
+    db.getPhoto(scanId).then((jpeg) => {
+      if (!jpeg) return;
+      url = URL.createObjectURL(new Blob([jpeg as BlobPart], { type: 'image/jpeg' }));
+      setPhotoUrl(url);
+    });
+    return () => {
+      if (url) URL.revokeObjectURL(url);
+    };
   }, [scanId]);
 
   const update = async (patch: Parameters<typeof db.updateScan>[1]) => {
@@ -312,16 +335,37 @@ function EditSheet({ scanId, onClose, onChanged, onDelete }: { scanId: number; o
 
   if (!scan) return null;
   const finishes = printing?.finishes ?? [scan.finish];
+  const review = scan.status === 'review' || !scan.printing_id;
 
   return (
-    <Sheet title={scan.name} onClose={onClose}>
+    <Sheet title={review ? `Scan #${scan.seq}: ${reviewTitle(scan)}` : scan.name} onClose={onClose}>
+      {photoUrl && <img src={photoUrl} alt="Scanned card" style={{ width: '100%', maxHeight: 320, objectFit: 'contain', borderRadius: 10, marginBottom: 8 }} />}
+      {scan.candidates.length > 0 && (review || scan.status === 'check') && (
+        <>
+          <div className="field-label">{review ? 'Tap the right printing' : 'Candidates'}</div>
+          <ul className="list">
+            {scan.candidates.slice(0, 3).map((c) => (
+              <li key={c.printing_id}>
+                <button className="item" aria-pressed={c.printing_id === scan.printing_id} onClick={() => update({ printing_id: c.printing_id })}>
+                  <Thumb id={c.printing_id} ver={c.img_ver ?? null} setCode={c.set_code} />
+                  <div className="grow">
+                    <div className="name">{c.name}</div>
+                    <div className="sub">[{c.set_code.toUpperCase()} {c.collector_number}]{c.score != null ? ` · ${Math.round(c.score * 100)}%` : ''}</div>
+                  </div>
+                  {c.printing_id === scan.printing_id && <div className="right">✓</div>}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
       <button className="item" onClick={() => setPicking(true)}>
         <Thumb id={scan.printing_id} ver={scan.img_ver} setCode={scan.set_code} />
         <div className="grow">
-          <div className="name">{scan.set_name}</div>
-          <div className="sub">[{scan.set_code.toUpperCase()} {scan.collector_number}]</div>
+          <div className="name">{review ? 'Search all cards' : scan.set_name}</div>
+          {!review && <div className="sub">[{scan.set_code.toUpperCase()} {scan.collector_number}]</div>}
         </div>
-        <div className="right">Change printing ›</div>
+        <div className="right">{review ? '›' : 'Change printing ›'}</div>
       </button>
       {scan.flag_reason && <p className="small" style={{ color: 'var(--check)' }}>{scan.flag_reason}</p>}
 

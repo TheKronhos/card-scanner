@@ -45,6 +45,37 @@ export function ExportSheet({ session, rows, onClose }: { session: Session; rows
 
   const kinds: ExportKind[] = session.kind === 'verify' ? ['differences', 'review'] : ['master', 'review', 'manabox'];
 
+  // Just scan: one export, never blocked by the review queue (those rows go out with Status = review).
+  const scanFile = async () => {
+    setError('');
+    try {
+      const f = await db.exportScanFile(session.id);
+      const outcome = await shareFile(f.filename, f.bytes, 'application/zip');
+      if (outcome !== 'cancelled') setStatus(`${outcome === 'shared' ? 'Shared' : 'Saved'} ${f.filename}: ${f.rows} rows, ${f.photos} photos`);
+    } catch (e) {
+      setError(errorText(e));
+    }
+  };
+
+  if (session.kind === 'scan') {
+    return (
+      <Sheet title="Export" onClose={onClose}>
+        {review > 0 && (
+          <div className="panel warn">
+            <b>{review} cards still need review.</b> They are included with Status “review” and their top 3 candidates, so you can resolve them later.
+          </div>
+        )}
+        <button className="btn primary big block" onClick={scanFile}>Scan file (ZIP)</button>
+        <p className="small muted">
+          scan.csv has one row per scanned copy, in scan order. photos/ has the straightened image of every check or review card,
+          named by scan number (e.g. 0042.jpg). Settings can include photos for every card.
+        </p>
+        {status && <p>{status}</p>}
+        {error && <p className="err">{error}</p>}
+      </Sheet>
+    );
+  }
+
   return (
     <Sheet title="Export" onClose={onClose}>
       {review > 0 && (

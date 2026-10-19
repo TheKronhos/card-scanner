@@ -1,8 +1,8 @@
 export type ShareOutcome = 'shared' | 'downloaded' | 'cancelled';
 
 /** Open the system share sheet with a file (Drive, email, Files...). Falls back to a download. */
-export async function shareFile(filename: string, text: string, mime = 'text/csv'): Promise<ShareOutcome> {
-  const file = new File([text], filename, { type: mime });
+export async function shareFile(filename: string, data: string | Uint8Array, mime = 'text/csv'): Promise<ShareOutcome> {
+  const file = new File([data as BlobPart], filename, { type: mime });
   if (navigator.canShare?.({ files: [file] })) {
     try {
       await navigator.share({ files: [file], title: filename });

@@ -7,6 +7,7 @@ import { DataView } from './ui/DataView';
 import { Home } from './ui/Home';
 import { useRoute } from './ui/nav';
 import { SessionView } from './ui/SessionView';
+import { SettingsView } from './ui/SettingsView';
 
 type Boot = { state: 'loading' } | { state: 'ready' } | { state: 'error'; error: string };
 
@@ -44,6 +45,8 @@ export default function App() {
       return <CollectionView meta={meta} back={back} go={go} />;
     case 'data':
       return <DataView meta={meta} onChanged={reloadMeta} back={back} />;
+    case 'settings':
+      return <SettingsView back={back} />;
     case 'about':
       return <About meta={meta} back={back} />;
     default:

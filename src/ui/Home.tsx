@@ -7,6 +7,12 @@ import { Segmented, Sheet, errorText } from './common';
 import type { Route } from './nav';
 
 const FOIL_LABEL: Record<FoilMode, string> = { nonfoil: 'Non-foil', foil: 'Foil', ask: 'Ask each card' };
+const KIND_LABEL: Record<SessionKind, string> = { scan: 'Just scan', add: 'Add new', verify: 'Verify' };
+const KIND_HELP: Record<SessionKind, string> = {
+  scan: 'Records exactly what you scan. One export: a Scan file (ZIP with scan.csv and photos of uncertain cards).',
+  add: 'Shows what you already own. Exports: master paste, review sheet, ManaBox.',
+  verify: 'Import the rows you are checking, scan the cards, and export only the differences.',
+};
 
 export function Home({ meta, go }: { meta: CardsMeta | null; go: (r: Route) => void }) {
   const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
@@ -20,6 +26,7 @@ export function Home({ meta, go }: { meta: CardsMeta | null; go: (r: Route) => v
     <div className="app">
       <div className="bar">
         <h1>Card Scanner</h1>
+        <button className="btn icon ghost" aria-label="Settings" onClick={() => go({ name: 'settings' })}>⚙︎</button>
         <button className="btn icon ghost" aria-label="About" onClick={() => go({ name: 'about' })}>ⓘ</button>
       </div>
       <div className="scroll">
@@ -43,8 +50,7 @@ export function Home({ meta, go }: { meta: CardsMeta | null; go: (r: Route) => v
                 <div className="grow">
                   <div className="name">{s.name}</div>
                   <div className="sub">
-                    {s.kind === 'verify' ? 'Verify · ' : ''}
-                    {FOIL_LABEL[s.foil_mode]} · {new Date(s.updated_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                    {KIND_LABEL[s.kind]} · {FOIL_LABEL[s.foil_mode]} · {new Date(s.updated_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
                   </div>
                 </div>
                 <div className="right">
@@ -73,7 +79,7 @@ function defaultName() {
 
 function NewSessionSheet({ onClose, onCreated }: { onClose: () => void; onCreated: (id: number) => void }) {
   const [name, setName] = useState(defaultName);
-  const [kind, setKind] = useState<SessionKind>('add');
+  const [kind, setKind] = useState<SessionKind>('scan');
   const [foil, setFoil] = useState<FoilMode>('nonfoil');
   const [error, setError] = useState('');
 
@@ -96,13 +102,9 @@ function NewSessionSheet({ onClose, onCreated }: { onClose: () => void; onCreate
       <Segmented<SessionKind>
         value={kind}
         onChange={setKind}
-        options={[{ value: 'add', label: 'Add new cards' }, { value: 'verify', label: 'Verify existing' }]}
+        options={[{ value: 'scan', label: 'Just scan' }, { value: 'add', label: 'Add new' }, { value: 'verify', label: 'Verify' }]}
       />
-      <p className="small muted">
-        {kind === 'add'
-          ? 'Normal exports: master paste, review sheet, ManaBox.'
-          : 'Import the rows you are checking, scan the cards, and export only the differences.'}
-      </p>
+      <p className="small muted">{KIND_HELP[kind]}</p>
       <div className="field-label">Foil</div>
       <Segmented<FoilMode>
         value={foil}

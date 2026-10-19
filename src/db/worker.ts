@@ -16,10 +16,16 @@ function setMeta(key: string, value: string) {
 }
 const getMeta = (db: Database, key: string) => db.selectValue('SELECT value FROM meta WHERE key = ?', [key]) as string | undefined;
 
+/** Reads from browser file storage are slow; keep pages and temp tables in memory. */
+function tune(db: Database) {
+  db.exec('PRAGMA cache_size = -65536; PRAGMA temp_store = MEMORY');
+}
+
 function openCards(user: Database): Database | null {
   const name = getMeta(user, 'cards_file');
   if (!name || !pool.getFileNames().includes(name)) return null;
   const db = new pool.OpfsSAHPoolDb(name);
+  tune(db);
   if (Number(getMeta(db, 'schema_version')) !== PACK_SCHEMA_VERSION) {
     db.close();
     return null;
@@ -46,9 +52,12 @@ async function init(): Promise<InitResult> {
     return { ok: false, error: `This browser can't store the app's data (${msg}).` };
   }
   const user = new pool.OpfsSAHPoolDb(USER_DB);
+  tune(user);
   migrateUserDb(user);
   repo = new Repo(user, null);
   repo.cards = openCards(user);
+  // Build the name search index right after startup so the first search is instant.
+  setTimeout(() => repo.warmUp(), 500);
   return { ok: true };
 }
 
@@ -118,6 +127,7 @@ async function refresh(baseUrl: string, onProgress: (p: RefreshProgress) => void
     return done ? undefined : value;
   });
   const fresh = new pool.OpfsSAHPoolDb(name);
+  tune(fresh);
   const count = Number(fresh.selectValue('SELECT COUNT(*) FROM printings'));
   if (count !== manifest.card_count) {
     fresh.close();
@@ -135,6 +145,7 @@ async function refresh(baseUrl: string, onProgress: (p: RefreshProgress) => void
   for (const f of pool.getFileNames()) if (f.startsWith('/cards-') && f !== name) pool.unlink(f);
 
   const rematched = repo.rematchImports();
+  repo.warmUp();
   onProgress({ phase: 'done' });
   return { updated: true, version: manifest.version, rematched };
 }

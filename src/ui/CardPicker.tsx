@@ -59,6 +59,7 @@ export function CardPicker({ onPick, onClose, oracleId, title = 'Add card' }: {
   const [owned, setOwned] = useState<Record<string, Owned>>({});
   const [error, setError] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
+  const latest = useRef(0);
 
   useEffect(() => {
     if (card || q.trim().length < 2) {
@@ -66,7 +67,11 @@ export function CardPicker({ onPick, onClose, oracleId, title = 'Add card' }: {
       return;
     }
     const t = setTimeout(() => {
-      db.search(q).then(setHits).catch((e) => setError(errorText(e)));
+      // Only the newest search may update the list; slower, older answers are dropped.
+      const ticket = ++latest.current;
+      db.search(q)
+        .then((h) => ticket === latest.current && setHits(h))
+        .catch((e) => setError(errorText(e)));
     }, 120);
     return () => clearTimeout(t);
   }, [q, card]);
