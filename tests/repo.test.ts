@@ -130,3 +130,33 @@ describe('Repo: Master import', () => {
     expect(repo.exportSession(s.id, 'master').text).toBe('"Jace, the Mind Sculptor [2XM 56]"\r\n"Jace, the Mind Sculptor [2XM 56]"\r\n');
   });
 });
+
+describe('Repo: real Master sample (tests/fixtures/master-sample.csv)', () => {
+  it('matches 16 of 18 rows and agrees with the sheet’s Colors column', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { colorLabel, masterColorLabel } = await import('../src/lib/cards');
+    const text = readFileSync(new URL('./fixtures/master-sample.csv', import.meta.url), 'utf8');
+    const repo = await makeRepo();
+    const sum = repo.importCsv(text, 'master-sample.csv', 'collection');
+    expect(sum).toMatchObject({ rows: 18, matched_rows: 16, copies: 42, matched_copies: 40 });
+
+    const rows = repo.importRows(sum.id);
+    const unmatched = rows.filter((r) => !r.printing_id).map((r) => [r.card_name, r.note]);
+    expect(unmatched).toEqual([
+      ['Enormous Rat', 'No printing FDN 59b in the card data'],
+      ['Olna Ally Shopkeep', 'No set or collector number in the sheet'],
+    ]);
+
+    const sheetColors = new Map(parseCsv(text).slice(1).map((r) => [r[0], r[3]]));
+    for (const r of rows.filter((x) => x.printing_id)) {
+      const p = repo.getPrinting(r.printing_id!)!;
+      expect(colorLabel(p.colors, p.front_type), r.card_name).toBe(masterColorLabel(sheetColors.get(r.card_name)!));
+    }
+
+    // Treatment words are labels only: "Full Art Foil" is foil, "Japanese Alt-Art" is non-foil.
+    const fracture = repo.lookup('soa', '65')[0];
+    const zombify = repo.lookup('fdn', '187')[0];
+    expect(repo.owned([fracture.id])[fracture.id]).toEqual({ nonfoil: 0, foil: 1, etched: 0 });
+    expect(repo.owned([zombify.id])[zombify.id]).toEqual({ nonfoil: 3, foil: 0, etched: 0 });
+  });
+});
