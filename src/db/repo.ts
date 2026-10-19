@@ -1,12 +1,12 @@
 import type { Database, SqlValue } from '@sqlite.org/sqlite-wasm';
-import { chooseFinish, masterColorLabel, normName, priceFor, sessionFinishFlag } from '../lib/cards';
+import { chooseFinish, isScannable, masterColorLabel, normName, priceFor, sessionFinishFlag } from '../lib/cards';
 import type { DiffRow, Holding } from '../lib/diff';
 import { verifyDiff } from '../lib/diff';
 import { differencesCsv, manaboxCsv, masterPasteCsv, reviewCsv } from '../lib/exports';
 import { matchRows, parseMasterCsv } from '../lib/importMaster';
 import { photoPath, scanFileCsv, wantsPhoto } from '../lib/scanFile';
 import { identify, type IdentifyInput, type Identification, type NameHit } from '../scan/decide';
-import { similarity } from '../scan/parse';
+import { spanSimilarity, wordSpans } from '../scan/parse';
 import { strToU8, zipSync, type Zippable } from 'fflate';
 import type { MatchedRow } from '../lib/importMaster';
 import type {
@@ -105,7 +105,7 @@ export function migrateUserDb(db: Database): void {
   }
 }
 
-const PRINTING_SELECT = `SELECT p.*, COALESCE(s.name, upper(p.set_code)) AS set_name
+const PRINTING_SELECT = `SELECT p.*, COALESCE(s.name, upper(p.set_code)) AS set_name, COALESCE(s.set_type, '') AS set_type
   FROM printings p LEFT JOIN sets s ON s.code = p.set_code`;
 
 const list = (v: SqlValue) => (v ? String(v).split(',').filter(Boolean) : []);
@@ -119,6 +119,7 @@ function toPrinting(r: Row): Printing {
     face_names: r.face_names ? JSON.parse(String(r.face_names)) : null,
     set_code: String(r.set_code),
     set_name: String(r.set_name),
+    set_type: String(r.set_type ?? ''),
     collector_number: String(r.collector_number),
     rarity: String(r.rarity ?? ''),
     lang: String(r.lang ?? 'en'),
@@ -201,6 +202,8 @@ interface NameEntry {
   /** Normalized face names of double-faced, split and adventure cards (OCR reads one face). */
   faces: string[];
   printings: number;
+  /** Printings recognition may match (see isScannable); 0 = never offered as a scan result. */
+  scannable: number;
 }
 
 export interface Owned {
@@ -378,18 +381,16 @@ export class Repo {
   matchName(text: string, limit = 5): NameHit[] {
     const q = normName(text);
     if (q.length < 3) return [];
+    const spans = wordSpans(q);
     const hits: NameHit[] = [];
     for (const e of this.nameIndex()) {
+      if (!e.scannable) continue;
       let best = 0;
-      for (const n of e.faces.length ? [e.norm, ...e.faces] : [e.norm]) {
-        // Cheap length filter before the edit distance.
-        if (Math.abs(n.length - q.length) > Math.max(n.length, q.length) * 0.4) continue;
-        const sc = similarity(q, n);
-        if (sc > best) best = sc;
-      }
+      for (const n of e.faces.length ? [e.norm, ...e.faces] : [e.norm]) best = Math.max(best, spanSimilarity(spans, n));
       if (best >= 0.5) hits.push({ oracle_id: e.oracle_id, name: e.name, score: best });
     }
-    return hits.sort((a, b) => b.score - a.score || a.name.length - b.name.length).slice(0, limit);
+    // Equal scores: the longer name explains more of the line ("Shared Roots" over "Roots").
+    return hits.sort((a, b) => b.score - a.score || b.name.length - a.name.length).slice(0, limit);
   }
 
   private sets: { db: Database; codes: Set<string> } | null = null;
@@ -408,9 +409,10 @@ export class Repo {
   identify(input: IdentifyInput): Identification {
     return identify(input, {
       knownSets: this.setCodes(),
-      lookup: (s, n) => this.lookup(s, n),
+      // Recognition never matches tokens, Art Series and other non-playable printings.
+      lookup: (s, n) => this.lookup(s, n).filter(isScannable),
       matchName: (t, l) => this.matchName(t, l),
-      printingsOf: (o) => this.printingsOf(o),
+      printingsOf: (o) => this.printingsOf(o).filter(isScannable),
     });
   }
 
@@ -429,17 +431,28 @@ export class Repo {
       // One sequential pass over the table, grouped here: in the browser's file storage a GROUP BY (index order, random
       // page reads) took ~9 s against ~0.1 s for this.
       const byOracle = new Map<string, NameEntry>();
+      // Packs built before flavor names were added don't have the column.
+      const hasFlavor = db.selectObjects('PRAGMA table_info(printings)').some((c) => c.name === 'flavor_name');
       db.exec({
-        sql: 'SELECT oracle_id, name, name_norm FROM printings WHERE oracle_id IS NOT NULL',
+        sql: `SELECT p.oracle_id, p.name, p.name_norm, p.layout, COALESCE(s.set_type, ''), ${hasFlavor ? 'p.flavor_name' : 'NULL'}
+                FROM printings p LEFT JOIN sets s ON s.code = p.set_code WHERE p.oracle_id IS NOT NULL`,
         rowMode: 'array',
         callback: (r) => {
           const id = String(r[0]);
-          const e = byOracle.get(id);
-          if (e) e.printings++;
-          else {
+          const ok = isScannable({ layout: String(r[3]), set_type: String(r[4]) }) ? 1 : 0;
+          let e = byOracle.get(id);
+          if (e) {
+            e.printings++;
+            e.scannable += ok;
+          } else {
             const name = String(r[1]);
             const faces = name.includes(' // ') ? name.split(' // ').map(normName) : [];
-            byOracle.set(id, { oracle_id: id, name, norm: String(r[2]), faces, printings: 1 });
+            e = { oracle_id: id, name, norm: String(r[2]), faces, printings: 1, scannable: ok };
+            byOracle.set(id, e);
+          }
+          // Universes Beyond printed names ("Ardyn Izunia" for Varragoth, Bloodsky Sire) match the same card.
+          if (r[5]) {
+            for (const f of String(r[5]).split(' // ').map(normName)) if (f && !e.faces.includes(f)) e.faces.push(f);
           }
         },
       });

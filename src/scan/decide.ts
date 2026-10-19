@@ -1,5 +1,6 @@
 import { nameMatches } from '../lib/cards';
 import type { Printing, ScanStatus } from '../lib/types';
+import { LIST_NO, LIST_YES, type Marks } from './marks';
 import { parseCollector, parseSlashNumber, type CollectorInfo } from './parse';
 
 export interface NameHit {
@@ -22,6 +23,8 @@ export interface IdentifyInput {
   nameTexts: string[];
   collectorText: string;
   bottomText?: string;
+  /** List symbol / promo stamp measurements from the photo (see marks.ts). */
+  marks?: Marks;
 }
 
 export interface Identification {
@@ -89,7 +92,7 @@ export function identify(input: IdentifyInput, L: Lookups): Identification {
   }
   const hits = input.nameTexts
     .filter((t) => t.trim().length >= 3)
-    .flatMap((t) => L.matchName(t, 5))
+    .flatMap((t) => L.matchName(t, 10))
     .sort((a, b) => b.score - a.score);
   const best = hits[0] && hits[0].score >= NAME_HINT ? hits[0] : null;
   const nameOk = !!best && best.score >= NAME_OK;
@@ -103,15 +106,43 @@ export function identify(input: IdentifyInput, L: Lookups): Identification {
   // 1. Set code + number on the card (2015+ layout).
   const byCollector = collector.set ? uniqueById(collector.numbers.flatMap((n) => L.lookup(collector.set!, n))) : [];
   if (byCollector.length) {
-    const agree = nameOk ? byCollector.find((p) => nameMatches(p, best!.name)) : undefined;
-    if (agree) {
+    // Agreement: any strong name reading is this printing's card (by oracle id, so printed/flavor names and faces
+    // count). Not only the top reading: a short word inside the name line can tie with the full name.
+    const agreeHit = hits.find((h) => h.score >= NAME_OK && byCollector.some((p) => p.oracle_id === h.oracle_id || nameMatches(p, h.name)));
+    const agree = agreeHit ? byCollector.find((p) => p.oracle_id === agreeHit.oracle_id || nameMatches(p, agreeHit.name)) : undefined;
+    if (agree && agreeHit) {
       const alike = lookalikes(agree, L);
-      const flags = [
-        alike.some((p) => p.set_code === 'plst') ? 'could be The List (check for a planeswalker symbol)' : '',
-        alike.some((p) => p.set_code !== 'plst') ? 'could be a stamped promo (check for a stamp)' : '',
-        ART_PENDING,
-      ];
-      return result('check', agree, alike, 0.6 + best!.score * 0.3, ['Name and set/number agree', ...flags], read);
+      const list = alike.find((p) => p.set_code === 'plst');
+      const promoPack = alike.find((p) => p.set_code !== 'plst' && p.collector_number.endsWith('p'));
+      const prerelease = alike.find((p) => p.set_code !== 'plst' && p.collector_number.endsWith('s'));
+      const bright = input.marks?.listBright ?? null;
+      // The List symbol test is only reliable on the modern black-border frame (older frames have light marks there).
+      const modern = agree.frame === '2015' && agree.border_color === 'black';
+      let chosen: Printing | null = agree;
+      const flags = ['Name and set/number agree'];
+      if (list) {
+        if (modern && bright != null && bright >= LIST_YES) {
+          chosen = list;
+          flags.push('The List symbol detected');
+        } else if (modern && bright != null && bright <= LIST_NO) {
+          flags.push('no List symbol seen');
+        } else {
+          chosen = null;
+          flags.push('could be The List; tap the right one (List cards have a planeswalker symbol at bottom left)');
+        }
+      }
+      // Stamped twins can't be told apart yet: rather than guess, both are offered.
+      if (promoPack) {
+        chosen = null;
+        flags.push('could be a promo-pack card; tap the right one (promo-pack cards have a planeswalker stamp in the art)');
+      }
+      if (prerelease) {
+        chosen = null;
+        flags.push('could be a prerelease promo; tap the right one (prerelease cards have a date stamp in the art)');
+      }
+      if (!chosen) return result('review', null, [agree, ...alike], 0.5, flags, { ...read, name: agreeHit });
+      flags.push(ART_PENDING);
+      return result('check', chosen, [agree, ...alike], 0.6 + agreeHit.score * 0.3, flags, { ...read, name: agreeHit });
     }
     const others = best ? L.printingsOf(best.oracle_id).filter((p) => p.set_code === collector.set) : [];
     const why = !best ? 'Name unreadable' : !nameOk ? 'Name only partly readable' : 'Name and set/number disagree';

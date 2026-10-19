@@ -17,6 +17,7 @@ export interface Printing {
   face_names: string[] | null;
   set_code: string; // lowercase Scryfall code
   set_name: string;
+  set_type: string;
   collector_number: string;
   rarity: string;
   lang: string;

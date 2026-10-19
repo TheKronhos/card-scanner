@@ -37,6 +37,7 @@ export const browserOcr: OcrFn = async (img, kind) => {
     tessedit_pageseg_mode: kind === 'name' ? PSM.SINGLE_LINE : PSM.SINGLE_BLOCK,
     tessedit_char_whitelist: kind === 'collector' ? 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/-• ' : '',
   });
-  const r = await worker.recognize(toCanvas(img));
-  return { text: r.data.text, confidence: r.data.confidence / 100 };
+  const r = await worker.recognize(toCanvas(img), {}, { text: true, blocks: kind === 'collector' });
+  const lines = (r.data.blocks ?? []).flatMap((b) => b.paragraphs.flatMap((p) => p.lines.map((l) => ({ text: l.text, ...l.bbox }))));
+  return { text: r.data.text, confidence: r.data.confidence / 100, lines };
 };

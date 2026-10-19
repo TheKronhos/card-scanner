@@ -117,3 +117,28 @@ describe('set code lookalikes', () => {
     expect(parseCollector('085 U\nXYZ EN MARTA', s).set).toBeNull();
   });
 });
+
+describe('non-playable cards are never a scan result', () => {
+  it('a name that only matches tokens finds nothing', async () => {
+    const { isScannable } = await import('../src/lib/cards');
+    expect(isScannable({ layout: 'art_series', set_type: 'memorabilia' })).toBe(false);
+    expect(isScannable({ layout: 'token', set_type: 'token' })).toBe(false);
+    expect(isScannable({ layout: 'normal', set_type: 'memorabilia' })).toBe(false);
+    expect(isScannable({ layout: 'transform', set_type: 'expansion' })).toBe(true);
+    expect(isScannable({ layout: 'normal', set_type: 'funny' })).toBe(true);
+  });
+});
+
+describe('collector line cases from real cards', () => {
+  const s = new Set(['ecl', 'mid', 'spg', 'tdm', 'znr']);
+  it('splits a glued rarity and number', () => {
+    expect(parseCollector('CC\nM0004\nECL EN DAREN BADER', s)).toMatchObject({ set: 'ecl', numbers: ['4'], rarity: 'M' });
+  });
+  it('prefers the real number over stray digits', () => {
+    expect(parseCollector('2 YT\n098/277 C\nMID EN PAUL SCOTT CANAVAN', s).numbers).toEqual(['98']);
+    expect(parseCollector('4 LANG WW AA4 U\n259/280 R\nZNR EN JOHANNES VOSS', s).numbers).toEqual(['259']);
+  });
+  it('takes the set code before the language code (Special Guests)', () => {
+    expect(parseCollector('M 0107 TDM S G\nSPG EN DOMINIK MAYER', s)).toMatchObject({ set: 'spg', numbers: ['107'] });
+  });
+});

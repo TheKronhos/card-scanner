@@ -4,7 +4,7 @@ import type { AddScanInput } from '../db/repo';
 import { chooseFinish } from '../lib/cards';
 import type { Candidate, Finish, Printing, Scan, ScanStatus, Session } from '../lib/types';
 import { FINISH_LABEL } from '../lib/types';
-import { CameraError, captureCard, cardJpeg, guideRect, openCamera, setTorch, stopCamera, torchSupported } from '../scan/camera';
+import { CameraError, captureCard, cardJpeg, guideRect, openCamera, sampleDiff, sampleGuide, setTorch, stopCamera, torchSupported } from '../scan/camera';
 import { warmUpOcr, browserOcr } from '../scan/ocr';
 import { prepareCrops, readCard } from '../scan/pipeline';
 import { Sheet, errorText } from './common';
@@ -15,6 +15,16 @@ import { feedback } from './feedback';
  * calibrated on real photos; a blurry card still can't be saved wrongly, it just lands in review.
  */
 const MIN_SHARPNESS = 2;
+
+/**
+ * Repeat capture: within this long of the last capture, with no motion in between and the same picture in the box,
+ * a new capture replaces the last row instead of adding one (until stage 3's duplicate guard).
+ */
+const REPEAT_MS = 5000;
+/** Sample difference that counts as motion (hand or card crossing the box). */
+const MOTION = 22;
+/** Sample difference below which two captures show the same, unmoved card. */
+const SAME = 12;
 
 const toCandidate = (p: Printing): Candidate => ({
   printing_id: p.id,
@@ -51,8 +61,13 @@ export function ScanView({ session, onClose, onSearch, onChanged }: {
   const [last, setLast] = useState<Scan | null>(null);
   const [replaceNext, setReplaceNext] = useState(false);
   const [ocrReady, setOcrReady] = useState(false);
-  const [askFinish, setAskFinish] = useState<{ printing: Printing; input: AddScanInput } | null>(null);
+  const [askFinish, setAskFinish] = useState<{ printing: Printing; input: AddScanInput; sample: Uint8Array | null } | null>(null);
   const [view, setView] = useState({ w: 0, h: 0 });
+  const sampleCanvas = useRef<HTMLCanvasElement | null>(null);
+  const prevSample = useRef<Uint8Array | null>(null);
+  const motionSinceCapture = useRef(true);
+  const lastCapture = useRef<{ at: number; sample: Uint8Array; scanId: number } | null>(null);
+  const knownSets = useRef<Set<string> | null>(null);
 
   const start = useCallback(async () => {
     setState('starting');
@@ -80,6 +95,19 @@ export function ScanView({ session, onClose, onSearch, onChanged }: {
     return () => stopCamera(streamRef.current);
   }, [start, session.id]);
 
+  // Watch the box a few times a second: any big change between captures means a new card was put down.
+  useEffect(() => {
+    if (state !== 'live') return;
+    sampleCanvas.current ??= document.createElement('canvas');
+    const t = setInterval(() => {
+      const s = videoRef.current && sampleGuide(videoRef.current, sampleCanvas.current!);
+      if (!s) return;
+      if (prevSample.current && sampleDiff(s, prevSample.current) > MOTION) motionSinceCapture.current = true;
+      prevSample.current = s;
+    }, 150);
+    return () => clearInterval(t);
+  }, [state]);
+
   // Keep the guide box in sync with the preview size.
   useEffect(() => {
     const v = videoRef.current;
@@ -89,15 +117,27 @@ export function ScanView({ session, onClose, onSearch, onChanged }: {
     return () => ro.disconnect();
   }, []);
 
+  /** Same card, not moved, re-captured within a few seconds: the id of the row it should replace. */
+  const repeatOf = (sample: Uint8Array | null): number | null => {
+    const lc = lastCapture.current;
+    if (!lc || !sample || motionSinceCapture.current) return null;
+    if (performance.now() - lc.at > REPEAT_MS || sampleDiff(sample, lc.sample) > SAME) return null;
+    return last?.id === lc.scanId ? lc.scanId : null;
+  };
+
   /** Save the capture; `readName` labels a review-queue card in the result banner. */
-  const save = async (input: AddScanInput, readName: string | null, ms: number, sharp?: number) => {
-    const replacing = replaceNext && last;
-    const s = replacing ? await db.replaceScan(last.id, input) : await db.addScan(session.id, input);
+  const save = async (input: AddScanInput, readName: string | null, ms: number, sharp?: number, sample: Uint8Array | null = null) => {
+    const repeat = repeatOf(sample);
+    const replaceId = replaceNext && last ? last.id : repeat;
+    const replacing = replaceId != null;
+    const s = replacing ? await db.replaceScan(replaceId, input) : await db.addScan(session.id, input);
+    if (sample) lastCapture.current = { at: performance.now(), sample, scanId: s.id };
+    motionSinceCapture.current = false;
     setReplaceNext(false);
     setLast(s);
     feedback(s.status);
     const title = s.status === 'review' ? `Needs review: ${readName ?? 'unrecognized card'}` : `${s.name} [${s.set_code.toUpperCase()} ${s.collector_number}]`;
-    const prefix = replacing ? 'Replaced last · ' : '';
+    const prefix = repeat != null && !replaceNext ? 'Same card again, replaced last · ' : replacing ? 'Replaced last · ' : '';
     setResult({ status: s.status, title: prefix + title, detail: s.flag_reason, ms, sharp });
     onChanged();
   };
@@ -108,15 +148,19 @@ export function ScanView({ session, onClose, onSearch, onChanged }: {
     setBusy(true);
     try {
       const t0 = performance.now();
-      const { card } = captureCard(v);
-      const crops = prepareCrops(card);
+      const sample = sampleCanvas.current ? sampleGuide(v, sampleCanvas.current) : null;
+      const cuts = captureCard(v);
+      const cropsList = cuts.map((c) => prepareCrops(c.card));
+      const crops = cropsList[0];
       if (crops.sharpness < MIN_SHARPNESS) {
         feedback('review');
         setResult({ status: 'blurry', title: 'No card in focus: nothing saved', detail: 'Put the card inside the box, hold it still, and capture again.', ms: 0 });
         return;
       }
-      const readings = await readCard(crops, browserOcr);
-      const id = await db.identify({ nameTexts: readings.nameTexts, collectorText: readings.collectorText, bottomText: readings.bottomText });
+      knownSets.current ??= await db.setCodes();
+      const readings = await readCard(cropsList, browserOcr, knownSets.current);
+      const card = cuts[readings.cropIndex].card;
+      const id = await db.identify({ nameTexts: readings.nameTexts, collectorText: readings.collectorText, bottomText: readings.bottomText, marks: readings.marks });
       const photo = await cardJpeg(card);
       const ms = performance.now() - t0;
       const input: AddScanInput = {
@@ -129,11 +173,11 @@ export function ScanView({ session, onClose, onSearch, onChanged }: {
         photo,
       };
       if (id.printing && id.status !== 'review' && chooseFinish(id.printing.finishes, session.foil_mode).finish == null) {
-        setAskFinish({ printing: id.printing, input });
+        setAskFinish({ printing: id.printing, input, sample });
         setResult({ status: id.status, title: `${id.printing.name}: pick the finish`, detail: '', ms });
         return;
       }
-      await save(input, id.read.name?.name ?? null, ms, Math.round(crops.sharpness));
+      await save(input, id.read.name?.name ?? null, ms, Math.round(crops.sharpness), sample);
     } catch (e) {
       feedback('review');
       setResult({ status: 'review', title: 'Something went wrong: nothing saved', detail: errorText(e), ms: 0 });
@@ -217,7 +261,7 @@ export function ScanView({ session, onClose, onSearch, onChanged }: {
                   onClick={async () => {
                     const pending = askFinish;
                     setAskFinish(null);
-                    await save({ ...pending.input, finish: f }, pending.printing.name, 0);
+                    await save({ ...pending.input, finish: f }, pending.printing.name, 0, undefined, pending.sample);
                   }}
                 >
                   {FINISH_LABEL[f]}

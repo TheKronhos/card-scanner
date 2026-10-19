@@ -7,7 +7,7 @@ import sqlite3InitModule from '@sqlite.org/sqlite-wasm';
 import { createWorker, OEM, PSM } from 'tesseract.js';
 import { afterAll, beforeAll, describe, it } from 'vitest';
 import { Repo, migrateUserDb } from '../../src/db/repo';
-import { cutCard, resampleRgba, grayToRgba, type Gray, type Rgba } from '../../src/scan/image';
+import { cropFraction, cutCard, resampleRgba, grayToRgba, toGray, type CardCut, type Gray, type Rgba } from '../../src/scan/image';
 import { CARD_H, CARD_W } from '../../src/scan/regions';
 import { prepareCrops, readCard, type OcrFn } from '../../src/scan/pipeline';
 
@@ -39,6 +39,9 @@ function fakeFrame(card: Rgba, seed: number): { frame: Rgba; guide: { x: number;
       if (inCard) {
         const j = ((y - cy) * cw + (x - cx)) * 4;
         for (let k = 0; k < 3; k++) data[i + k] = soft.data[j + k] * 0.92 + 10 + noise;
+      } else if (process.env.DARK === '1') {
+        // Black playmat: no contrast with a black card border, so the edge search fails.
+        data[i] = data[i + 1] = data[i + 2] = 22 + noise;
       } else {
         data[i] = 120 + noise;
         data[i + 1] = 105 + noise;
@@ -63,6 +66,7 @@ describe.skipIf(!DB || !DIR)('recognition on images', () => {
     worker = await createWorker('eng', OEM.LSTM_ONLY, {
       langPath: new URL('../../node_modules/@tesseract.js-data/eng/4.0.0_best_int', import.meta.url).pathname,
       gzip: true,
+      cacheMethod: 'none',
     });
   }, 60_000);
   afterAll(async () => worker?.terminate());
@@ -75,8 +79,9 @@ describe.skipIf(!DB || !DIR)('recognition on images', () => {
       });
       const rgba = grayToRgba(g);
       const buf = jpeg.encode({ width: rgba.width, height: rgba.height, data: Buffer.from(rgba.data.buffer) }, 95).data;
-      const r = await worker.recognize(buf);
-      return { text: r.data.text, confidence: r.data.confidence / 100 };
+      const r = await worker.recognize(buf, {}, { text: true, blocks: kind === 'collector' });
+      const lines = (r.data.blocks ?? []).flatMap((b) => b.paragraphs.flatMap((p) => p.lines.map((l) => ({ text: l.text, ...l.bbox }))));
+      return { text: r.data.text, confidence: r.data.confidence / 100, lines };
     };
     const rows: string[] = [];
     let ok = 0;
@@ -84,24 +89,27 @@ describe.skipIf(!DB || !DIR)('recognition on images', () => {
     for (const f of readdirSync(DIR!).filter((x) => /\.jpe?g$/i.test(x)).sort()) {
       const raw = jpeg.decode(readFileSync(`${DIR}/${f}`), { useTArray: true });
       const img: Rgba = { width: raw.width, height: raw.height, data: new Uint8ClampedArray(raw.data.buffer) };
-      let card: Rgba;
-      let edgeNote = '';
+      let cuts: CardCut[];
       if (SIMULATE) {
         const { frame, guide } = fakeFrame(img, total + 1);
-        const cut = cutCard(frame, guide, CARD_W, CARD_H);
-        card = cut.card;
-        edgeNote = cut.edgesFound ? 'edges' : 'NO-EDGES';
+        cuts = cutCard(frame, guide, CARD_W, CARD_H);
       } else {
-        card = resampleRgba(img, { x: 0, y: 0, w: img.width, h: img.height }, CARD_W, CARD_H);
+        cuts = [{ card: resampleRgba(img, { x: 0, y: 0, w: img.width, h: img.height }, CARD_W, CARD_H), how: 'guide' }];
       }
-      const crops = prepareCrops(card);
+      const cropsList = cuts.map((c) => prepareCrops(c.card));
+      const crops = cropsList[0];
       if (DUMP) {
-        for (const k of ['name', 'collector'] as const) {
-          const rgba = grayToRgba(crops[k]);
+        for (const [k, g] of [['name', crops.name], ['collector', crops.collector[0]]] as const) {
+          const rgba = grayToRgba(g);
           writeFileSync(`${DUMP}/${f}.${k}.jpg`, jpeg.encode({ width: rgba.width, height: rgba.height, data: Buffer.from(rgba.data.buffer) }, 90).data);
         }
       }
-      const r = await readCard(crops, ocr);
+      const r = await readCard(cropsList, ocr, repo.setCodes());
+      const edgeNote = cuts[r.cropIndex].how;
+      if (DUMP) {
+        const lc = grayToRgba(toGray(cropFraction(cuts[r.cropIndex].card, { x: 0.0, y: 0.9, w: 0.2, h: 0.08 }, 80)));
+        writeFileSync(`${DUMP}/${f}.listarea.jpg`, jpeg.encode({ width: lc.width, height: lc.height, data: Buffer.from(lc.data.buffer) }, 90).data);
+      }
       const id = repo.identify(r);
       const [es, en] = f.replace(/\.jpe?g$/i, '').split(/_(.+)/);
       const expected = repo.lookup(es, en)[0];
@@ -113,7 +121,7 @@ describe.skipIf(!DB || !DIR)('recognition on images', () => {
         `${f.padEnd(20)} ${id.status.padEnd(6)} ${right ? 'RIGHT' : id.printing ? 'WRONG' : inCands ? 'in-cands' : 'missed'}  ` +
           `name="${r.nameTexts.join(" ~ ")}" (${id.read.name?.name ?? '-'} ${id.read.name?.score.toFixed(2) ?? ''})  ` +
           `coll="${r.collectorText.replace(/\n/g, ' | ')}" -> ${id.read.collector.set ?? '-'} ${id.read.collector.numbers.join('/') || '-'}  ` +
-          `${Math.round(r.ms)}ms sharp=${Math.round(crops.sharpness)} ${edgeNote}  ${id.flag}`,
+          `${Math.round(r.ms)}ms sharp=${Math.round(crops.sharpness)} ${edgeNote} list=${r.marks.listBright?.toFixed(2) ?? '-'}  ${id.flag}`,
       );
     }
     console.log(`\n${rows.join('\n')}\n${ok}/${total} exact printing\n`);

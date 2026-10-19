@@ -215,10 +215,58 @@ export function findCardEdges(img: Rgba): Rect | null {
 }
 
 /**
- * Cut the card out of a camera frame given where the on-screen guide box falls in it: searches a margin around the
- * guide for the card's own edges (falls back to the guide box) and resamples to outW × outH.
+ * Black text on white using a local threshold (mean of the surrounding window), which copes with uneven light and
+ * glare better than one global threshold. Inverts light-on-dark text like textBinarize.
  */
-export function cutCard(frame: Rgba, guide: Rect, outW: number, outH: number): { card: Rgba; edgesFound: boolean } {
+export function adaptiveBinarize(g: Gray, windowFrac = 0.5, c = 8): Gray {
+  const { width: w, height: h, data: d } = g;
+  const integral = new Float64Array((w + 1) * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let row = 0;
+    for (let x = 0; x < w; x++) {
+      row += d[y * w + x];
+      integral[(y + 1) * (w + 1) + x + 1] = integral[y * (w + 1) + x + 1] + row;
+    }
+  }
+  const r = Math.max(4, Math.round((h * windowFrac) / 2));
+  const mean = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - r);
+    const y1 = Math.min(h, y + r + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - r);
+      const x1 = Math.min(w, x + r + 1);
+      const sum = integral[y1 * (w + 1) + x1] - integral[y0 * (w + 1) + x1] - integral[y1 * (w + 1) + x0] + integral[y0 * (w + 1) + x0];
+      mean[y * w + x] = sum / ((y1 - y0) * (x1 - x0));
+    }
+  }
+  // Light text on a mostly dark background (the collector line on a black border) is read inverted.
+  const sorted = Uint8Array.from(d).sort();
+  const lightText = sorted[sorted.length >> 1] < 110;
+  const out = new Uint8Array(w * h);
+  for (let i = 0; i < d.length; i++) {
+    const isText = lightText ? d[i] > mean[i] + c : d[i] < mean[i] - c;
+    out[i] = isText ? 0 : 255;
+  }
+  return { width: w, height: h, data: out };
+}
+
+/** Card border thickness as a fraction of the card's width and height (about 3 mm on 63 × 88 mm). */
+const BORDER_X = 0.05;
+const BORDER_Y = 0.036;
+
+export interface CardCut {
+  card: Rgba;
+  /** How this crop was made: from the card's edges, edges grown by a border width, or the guide box. */
+  how: 'edges' | 'edges+border' | 'guide';
+}
+
+/**
+ * Cut the card out of a camera frame given where the on-screen guide box falls in it. Returns up to three candidate
+ * crops, most likely first: the card's own edges; the same grown by one border width (on a dark mat the edge search
+ * can find the inside of a black border instead of the card's outer edge); and the guide box as is.
+ */
+export function cutCard(frame: Rgba, guide: Rect, outW: number, outH: number): CardCut[] {
   const m = 0.08;
   const ax = Math.max(0, Math.round(guide.x - guide.w * m));
   const ay = Math.max(0, Math.round(guide.y - guide.h * m));
@@ -229,6 +277,13 @@ export function cutCard(frame: Rgba, guide: Rect, outW: number, outH: number): {
   const small = resampleRgba(frame, { x: ax, y: ay, w: aw, h: ah }, Math.round((aw / ah) * smallH), smallH);
   const edges = findCardEdges(small);
   const k = ah / smallH;
-  const rect = edges ? { x: ax + edges.x * k, y: ay + edges.y * k, w: edges.w * k, h: edges.h * k } : guide;
-  return { card: resampleRgba(frame, rect, outW, outH), edgesFound: !!edges };
+  const cuts: CardCut[] = [];
+  if (edges) {
+    const r = { x: ax + edges.x * k, y: ay + edges.y * k, w: edges.w * k, h: edges.h * k };
+    cuts.push({ card: resampleRgba(frame, r, outW, outH), how: 'edges' });
+    const grown = { x: r.x - r.w * BORDER_X, y: r.y - r.h * BORDER_Y, w: r.w * (1 + 2 * BORDER_X), h: r.h * (1 + 2 * BORDER_Y) };
+    cuts.push({ card: resampleRgba(frame, grown, outW, outH), how: 'edges+border' });
+  }
+  cuts.push({ card: resampleRgba(frame, guide, outW, outH), how: 'guide' });
+  return cuts;
 }

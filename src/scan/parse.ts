@@ -27,8 +27,6 @@ export function parseCollector(text: string, knownSets: Set<string>): CollectorI
   const clean = text.toUpperCase().replace(/[•·*°]/g, ' ').replace(/[^A-Z0-9/\-★ \n]/g, ' ');
   const tokens = clean.split(/[\s]+/).filter(Boolean);
 
-  let set: string | null = null;
-  let lang: string | null = null;
   // Set code misread like "OBL" for DBL: when the token sits right before a language code, try lookalike swaps and
   // accept only if exactly one real set code results.
   for (let i = 0; i < tokens.length - 1; i++) {
@@ -37,27 +35,31 @@ export function parseCollector(text: string, knownSets: Set<string>): CollectorI
     const fixed = lookalikeCodes(t).filter((c) => knownSets.has(c));
     if (fixed.length === 1) tokens[i] = fixed[0].toUpperCase();
   }
+  // Glued rarity and number ("M0004", "C0062"): split them.
   for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i];
-    if (!set && /^[A-Z0-9]{3,5}$/.test(t) && /[A-Z]/.test(t) && knownSets.has(t.toLowerCase())) {
-      set = t.toLowerCase();
-      // The language code follows the set code: "FDN • EN".
-      const next = tokens[i + 1];
-      if (next && LANGS.includes(next)) lang = next;
-      continue;
-    }
-    if (!lang && LANGS.includes(t) && set) lang = t;
+    const g = tokens[i].match(/^([CURMSLTP])([0-9O]{3,4}[A-Z]?)$/);
+    if (g) tokens.splice(i, 1, g[1], g[2]);
   }
 
-  // Collector number: digits (optionally with a letter suffix, e.g. "204p"), possibly "146/249". Prefer a token next to
-  // a rarity letter ("C 0062", "146/249 R"). A trailing S/B/... could be a suffix or a misread digit, so every plausible
-  // reading is returned and the card data decides.
+  const isSetToken = (t: string) => /^[A-Z0-9]{3,5}$/.test(t) && /[A-Z]/.test(t) && knownSets.has(t.toLowerCase());
+  // The set code is the one right before the language code ("SPG • EN"); Special Guests and similar cards also print
+  // the original set's code elsewhere on the line, which must not win.
+  let setAt = tokens.findIndex((t, i) => isSetToken(t) && LANGS.includes(tokens[i + 1] ?? ''));
+  if (setAt < 0) setAt = tokens.findIndex(isSetToken);
+  const set = setAt >= 0 ? tokens[setAt].toLowerCase() : null;
+  const lang = setAt >= 0 && LANGS.includes(tokens[setAt + 1] ?? '') ? tokens[setAt + 1] : null;
+
+  // Collector number: digits (optionally with a letter suffix, e.g. "204p"), possibly "146/249". Several number-like
+  // tokens can appear (stray marks, the artist line), so each is scored by how much it looks like the real thing:
+  // zero-padded ("0062"), with a total ("098/277"), or next to a rarity letter. A trailing S/B/... could be a suffix or
+  // a misread digit, so every plausible reading of the winner is returned and the card data decides.
   let numbers: string[] = [];
   let rarity: string | null = null;
-  for (let i = 0; i < tokens.length && !numbers.length; i++) {
+  let bestScore = -1;
+  for (let i = 0; i < tokens.length; i++) {
+    if (i === setAt) continue;
     const t = tokens[i];
-    if (set && t.toLowerCase() === set) continue;
-    const m = t.match(/^([0-9ODQILZSBG|]{1,4}[A-Z]?)(?:\/[0-9ODQILZSBG]{1,4})?$/);
+    const m = t.match(/^([0-9ODQILZSBG|]{1,4}[A-Z]?)(\/[0-9ODQILZSBG]{1,4})?$/);
     if (!m || !/[0-9]/.test(m[1])) continue;
     const strip = (x: string) => x.replace(/^0+(?=\d)/, '');
     const out = new Set<string>();
@@ -70,11 +72,17 @@ export function parseCollector(text: string, knownSets: Set<string>): CollectorI
     const all = fixDigits(raw);
     if (/^\d+$/.test(all)) out.add(strip(all));
     if (!out.size) continue;
-    numbers = [...out];
     const prev = tokens[i - 1];
     const next = tokens[i + 1];
-    if (prev && /^[CURMSLTP]$/.test(prev)) rarity = prev;
-    else if (next && /^[CURMSLTP]$/.test(next)) rarity = next;
+    const rar = prev && /^[CURMSLTP]$/.test(prev) ? prev : next && /^[CURMSLTP]$/.test(next) ? next : null;
+    const digits = fixDigits(raw.replace(/[A-Z]$/, ''));
+    const score =
+      (m[2] ? 3 : 0) + (/^0\d{3}$/.test(digits) ? 3 : 0) + (rar ? 2 : 0) + (digits.length >= 2 ? 1 : 0) - (/[A-Z]/.test(raw.replace(/[A-Z]$/, '')) ? 1 : 0);
+    if (score > bestScore) {
+      bestScore = score;
+      numbers = [...out];
+      rarity = rar;
+    }
   }
   return { set, numbers, rarity, lang, hasSetCode: !!set };
 }
@@ -134,6 +142,33 @@ export function editDistance(a: string, b: string, max = Infinity): number {
     prev = cur;
   }
   return prev[b.length];
+}
+
+/**
+ * Every run of consecutive words in an OCR'd name line (normalized text), so a name can be found inside junk such as
+ * "a) Brightclimb Pathway" or "Vibrance yu vem" (symbols misread as letters).
+ */
+export function wordSpans(normText: string, maxWords = 10): string[] {
+  const words = normText.split(' ').filter((w) => /[a-z]/.test(w)).slice(0, 12);
+  const out: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    for (let j = i + 1; j <= Math.min(words.length, i + maxWords); j++) out.push(words.slice(i, j).join(' '));
+  }
+  return out;
+}
+
+/** Best similarity of a name to any of the spans of similar length. */
+export function spanSimilarity(spans: string[], name: string): number {
+  let best = 0;
+  for (const s of spans) {
+    const len = Math.max(s.length, name.length);
+    // Only spans of roughly the name's length can score well; skip the rest cheaply.
+    if (Math.abs(s.length - name.length) > Math.max(2, name.length * 0.3)) continue;
+    const max = Math.floor(len * (1 - best));
+    const d = editDistance(s, name, max);
+    if (d <= max) best = Math.max(best, 1 - d / len);
+  }
+  return best;
 }
 
 /** 1 = identical, 0 = nothing in common. */

@@ -30,6 +30,18 @@ export function masterColorLabel(raw: string): string {
   return s;
 }
 
+const NOT_A_CARD_LAYOUTS = new Set(['token', 'double_faced_token', 'art_series', 'emblem', 'planar', 'scheme', 'vanguard', 'front_card']);
+const NOT_A_CARD_SET_TYPES = new Set(['token', 'memorabilia', 'minigame']);
+
+/**
+ * Whether recognition may ever match this printing. Tokens, emblems, Art Series, Jumpstart front cards, oversized
+ * planes/schemes and memorabilia (gold-bordered, Collectors' Edition, art cards) are never a scan result; they can
+ * still be added by hand from search.
+ */
+export function isScannable(p: Pick<Printing, 'layout' | 'set_type'>): boolean {
+  return !NOT_A_CARD_LAYOUTS.has(p.layout) && !NOT_A_CARD_SET_TYPES.has(p.set_type);
+}
+
 /** Lowercase, accents stripped, punctuation collapsed. Same as normName in the data pack builder. */
 export function normName(s: string): string {
   return s
