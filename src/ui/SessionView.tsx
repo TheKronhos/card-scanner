@@ -8,6 +8,7 @@ import { CONDITIONS, FINISH_LABEL } from '../lib/types';
 import { CardPicker, ownedText } from './CardPicker';
 import { FinishTag, Segmented, Sheet, Stepper, Thumb, Toast, errorText } from './common';
 import { ExportSheet } from './ExportSheet';
+import { ScanView } from './ScanView';
 import { feedback } from './feedback';
 import type { Route } from './nav';
 import { ImportRowsSheet } from './CollectionView';
@@ -37,6 +38,7 @@ export function SessionView({ id, meta, back }: { id: number; meta: CardsMeta | 
   const [diff, setDiff] = useState<DiffRow[]>([]);
   const [sheet, setSheet] = useState<
     | { kind: 'add' }
+    | { kind: 'scan' }
     | { kind: 'finish'; printing: Printing }
     | { kind: 'edit'; scanId: number }
     | { kind: 'export' }
@@ -159,7 +161,7 @@ export function SessionView({ id, meta, back }: { id: number; meta: CardsMeta | 
         {!meta && <div className="panel warn">Card data isn’t installed. Go to Card data on the home screen first.</div>}
 
         {rows.length === 0 ? (
-          <p className="muted" style={{ textAlign: 'center', marginTop: 28 }}>No cards yet. Tap Add card.</p>
+          <p className="muted" style={{ textAlign: 'center', marginTop: 28 }}>No cards yet. Tap Scan, or Search / add by name.</p>
         ) : (
           <ul className="list">
             {rows.map((r) => (
@@ -189,10 +191,13 @@ export function SessionView({ id, meta, back }: { id: number; meta: CardsMeta | 
         {rows.length > 0 && <p className="small muted" style={{ textAlign: 'center' }}>Swipe left to delete · tap to edit</p>}
       </div>
 
-      <div className="dock">
-        <button className="btn big" style={{ flex: 0.8 }} disabled={rows.length === 0} onClick={undoLast}>Undo</button>
-        <button className="btn primary big" style={{ flex: 1.4 }} disabled={!meta} onClick={() => setSheet({ kind: 'add' })}>Add card</button>
-        <button className="btn big" style={{ flex: 0.8 }} onClick={() => setSheet({ kind: 'export' })}>Export</button>
+      <div className="dock-col">
+        <button className="btn primary big block" disabled={!meta} onClick={() => setSheet({ kind: 'scan' })}>Scan</button>
+        <div className="row-gap">
+          <button className="btn" disabled={rows.length === 0} onClick={undoLast}>Undo</button>
+          <button className="btn" style={{ flex: 1.6 }} disabled={!meta} onClick={() => setSheet({ kind: 'add' })}>Search / add by name</button>
+          <button className="btn" onClick={() => setSheet({ kind: 'export' })}>Export</button>
+        </div>
       </div>
 
       {toast && (
@@ -205,6 +210,14 @@ export function SessionView({ id, meta, back }: { id: number; meta: CardsMeta | 
       )}
 
       {sheet?.kind === 'add' && <CardPicker onPick={onPick} onClose={() => setSheet(null)} />}
+      {sheet?.kind === 'scan' && (
+        <ScanView
+          session={session}
+          onClose={() => { setSheet(null); load(); }}
+          onSearch={() => { setSheet(null); setTimeout(() => setSheet({ kind: 'add' }), 50); }}
+          onChanged={load}
+        />
+      )}
       {sheet?.kind === 'finish' && (
         <Sheet title={`${sheet.printing.name} [${sheet.printing.set_code.toUpperCase()} ${sheet.printing.collector_number}]`} onClose={() => setSheet(null)}>
           <div className="stack">

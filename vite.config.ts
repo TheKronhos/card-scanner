@@ -52,10 +52,18 @@ export default defineConfig(({ command, isPreview }) => ({
         ],
       },
       workbox: {
-        globPatterns: ['**/*.{js,css,html,svg,png,wasm}'],
-        maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
+        globPatterns: ['**/*.{js,css,html,svg,png,wasm,gz}'],
+        // The OCR engine files are ~4 MB each and must be cached for offline scanning.
+        maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
+        globIgnores: ['ocr/tesseract-core-lstm.wasm.js'],
         navigateFallback: 'index.html',
         runtimeCaching: [
+          {
+            // Plain (no-SIMD) OCR engine: only very old browsers need it, so it's cached on first use instead.
+            urlPattern: /\/ocr\/tesseract-core-lstm\.wasm\.js$/,
+            handler: 'CacheFirst',
+            options: { cacheName: 'ocr-fallback' },
+          },
           {
             // Card thumbnails seen once stay available offline.
             urlPattern: /^https:\/\/cards\.scryfall\.io\//,

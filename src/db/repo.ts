@@ -5,6 +5,8 @@ import { verifyDiff } from '../lib/diff';
 import { differencesCsv, manaboxCsv, masterPasteCsv, reviewCsv } from '../lib/exports';
 import { matchRows, parseMasterCsv } from '../lib/importMaster';
 import { photoPath, scanFileCsv, wantsPhoto } from '../lib/scanFile';
+import { identify, type IdentifyInput, type Identification, type NameHit } from '../scan/decide';
+import { similarity } from '../scan/parse';
 import { strToU8, zipSync, type Zippable } from 'fflate';
 import type { MatchedRow } from '../lib/importMaster';
 import type {
@@ -196,6 +198,8 @@ interface NameEntry {
   oracle_id: string;
   name: string;
   norm: string;
+  /** Normalized face names of double-faced, split and adventure cards (OCR reads one face). */
+  faces: string[];
   printings: number;
 }
 
@@ -367,9 +371,55 @@ export class Repo {
 
   private names: { db: Database; list: NameEntry[] } | null = null;
 
+  /**
+   * Card names closest to an OCR reading, best first. Compares against the full name and each face name, so a
+   * double-faced card's front name matches "Front // Back".
+   */
+  matchName(text: string, limit = 5): NameHit[] {
+    const q = normName(text);
+    if (q.length < 3) return [];
+    const hits: NameHit[] = [];
+    for (const e of this.nameIndex()) {
+      let best = 0;
+      for (const n of e.faces.length ? [e.norm, ...e.faces] : [e.norm]) {
+        // Cheap length filter before the edit distance.
+        if (Math.abs(n.length - q.length) > Math.max(n.length, q.length) * 0.4) continue;
+        const sc = similarity(q, n);
+        if (sc > best) best = sc;
+      }
+      if (best >= 0.5) hits.push({ oracle_id: e.oracle_id, name: e.name, score: best });
+    }
+    return hits.sort((a, b) => b.score - a.score || a.name.length - b.name.length).slice(0, limit);
+  }
+
+  private sets: { db: Database; codes: Set<string> } | null = null;
+
+  /** Every set code in the card data (lowercase). */
+  setCodes(): Set<string> {
+    const db = this.requireCards();
+    if (this.sets?.db !== db) {
+      const codes = new Set(db.selectObjects('SELECT DISTINCT set_code FROM printings').map((r) => String(r.set_code)));
+      this.sets = { db, codes };
+    }
+    return this.sets.codes;
+  }
+
+  /** Recognize a card from its OCR text (see scan/decide.ts for the rules). */
+  identify(input: IdentifyInput): Identification {
+    return identify(input, {
+      knownSets: this.setCodes(),
+      lookup: (s, n) => this.lookup(s, n),
+      matchName: (t, l) => this.matchName(t, l),
+      printingsOf: (o) => this.printingsOf(o),
+    });
+  }
+
   /** Load the name index ahead of the first search (no-op without card data). */
   warmUp(): void {
-    if (this.cards) this.nameIndex();
+    if (this.cards) {
+      this.nameIndex();
+      this.setCodes();
+    }
   }
 
   /** One entry per card (oracle id), built once per card-data install; searching it is much faster than SQL LIKE. */
@@ -386,7 +436,11 @@ export class Repo {
           const id = String(r[0]);
           const e = byOracle.get(id);
           if (e) e.printings++;
-          else byOracle.set(id, { oracle_id: id, name: String(r[1]), norm: String(r[2]), printings: 1 });
+          else {
+            const name = String(r[1]);
+            const faces = name.includes(' // ') ? name.split(' // ').map(normName) : [];
+            byOracle.set(id, { oracle_id: id, name, norm: String(r[2]), faces, printings: 1 });
+          }
         },
       });
       this.names = { db, list: [...byOracle.values()] };

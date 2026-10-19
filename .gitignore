@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# copied from node_modules by scripts/copy-ocr.mjs
+public/ocr/
+# Tesseract cache written by the OCR tests
+*.traineddata
